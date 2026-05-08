@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2021 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,14 +16,15 @@ import os
 import re
 
 import numpy as np
+import PIL
 import torch
+from timm import create_model
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader, Dataset
-
-import PIL
-from accelerate import Accelerator
-from timm import create_model
 from torchvision.transforms import Compose, RandomResizedCrop, Resize, ToTensor
+
+from accelerate import Accelerator
+from accelerate.utils import set_seed
 
 
 ########################################################################
@@ -73,7 +73,7 @@ class PetsDataset(Dataset):
 
 def training_function(config, args):
     # Initialize accelerator
-    accelerator = Accelerator(fp16=args.fp16, cpu=args.cpu)
+    accelerator = Accelerator(cpu=args.cpu, mixed_precision=args.mixed_precision)
 
     # Sample hyper-parameters for learning rate, batch size, seed and a few other HPs
     lr = config["lr"]
@@ -94,10 +94,7 @@ def training_function(config, args):
     label_to_id = {lbl: i for i, lbl in enumerate(id_to_label)}
 
     # Set the seed before splitting the data.
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
+    set_seed(seed)
     # Split our filenames between train and validation
     random_perm = np.random.permutation(len(file_names))
     cut = int(0.8 * len(file_names))
@@ -139,16 +136,15 @@ def training_function(config, args):
     # Instantiate optimizer
     optimizer = torch.optim.Adam(params=model.parameters(), lr=lr / 25)
 
+    # Instantiate learning rate scheduler
+    lr_scheduler = OneCycleLR(optimizer=optimizer, max_lr=lr, epochs=num_epochs, steps_per_epoch=len(train_dataloader))
+
     # Prepare everything
     # There is no specific order to remember, we just need to unpack the objects in the same order we gave them to the
     # prepare method.
-    model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader
+    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
-
-    # Instantiate learning rate scheduler after preparing the training dataloader as the prepare method
-    # may change its length.
-    lr_scheduler = OneCycleLR(optimizer=optimizer, max_lr=lr, epochs=num_epochs, steps_per_epoch=len(train_dataloader))
 
     # Now we train the model
     for epoch in range(num_epochs):
@@ -167,26 +163,36 @@ def training_function(config, args):
         model.eval()
         accurate = 0
         num_elems = 0
-        for step, batch in enumerate(eval_dataloader):
+        for _, batch in enumerate(eval_dataloader):
             # We could avoid this line since we set the accelerator with `device_placement=True`.
             batch = {k: v.to(accelerator.device) for k, v in batch.items()}
             inputs = (batch["image"] - mean) / std
             with torch.no_grad():
                 outputs = model(inputs)
             predictions = outputs.argmax(dim=-1)
-            accurate_preds = accelerator.gather(predictions) == accelerator.gather(batch["label"])
+            predictions, references = accelerator.gather_for_metrics((predictions, batch["label"]))
+            accurate_preds = predictions == references
             num_elems += accurate_preds.shape[0]
             accurate += accurate_preds.long().sum()
 
         eval_metric = accurate.item() / num_elems
         # Use accelerator.print to print only on the main process.
         accelerator.print(f"epoch {epoch}: {100 * eval_metric:.2f}")
+    accelerator.end_training()
 
 
 def main():
     parser = argparse.ArgumentParser(description="Simple example of training script.")
     parser.add_argument("--data_dir", required=True, help="The data folder on disk.")
-    parser.add_argument("--fp16", action="store_true", help="If passed, will use FP16 training.")
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default=None,
+        choices=["no", "fp16", "bf16", "fp8"],
+        help="Whether to use mixed precision. Choose"
+        "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10."
+        "and an Nvidia Ampere GPU.",
+    )
     parser.add_argument("--cpu", action="store_true", help="If passed, will train on the CPU.")
     args = parser.parse_args()
     config = {"lr": 3e-2, "num_epochs": 3, "seed": 42, "batch_size": 64, "image_size": 224}

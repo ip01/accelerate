@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2021 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,18 +13,14 @@
 # limitations under the License.
 import argparse
 
+import evaluate
 import torch
+from datasets import load_dataset
+from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup, set_seed
 
 from accelerate import Accelerator, DistributedType
-from datasets import load_dataset, load_metric
-from transformers import (
-    AdamW,
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    get_linear_schedule_with_warmup,
-    set_seed,
-)
 
 
 ########################################################################
@@ -49,20 +44,19 @@ MAX_GPU_BATCH_SIZE = 16
 EVAL_BATCH_SIZE = 32
 
 
-def training_function(config, args):
-    # Initialize accelerator
-    accelerator = Accelerator(fp16=args.fp16, cpu=args.cpu)
+def get_dataloaders(accelerator: Accelerator, batch_size: int = 16):
+    """
+    Creates a set of `DataLoader`s for the `glue` dataset,
+    using "bert-base-cased" as the tokenizer.
 
-    # Sample hyper-parameters for learning rate, batch size, seed and a few other HPs
-    lr = config["lr"]
-    num_epochs = int(config["num_epochs"])
-    correct_bias = config["correct_bias"]
-    seed = int(config["seed"])
-    batch_size = int(config["batch_size"])
-
+    Args:
+        accelerator (`Accelerator`):
+            An `Accelerator` object
+        batch_size (`int`, *optional*):
+            The batch size for the train and validation DataLoaders.
+    """
     tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
     datasets = load_dataset("glue", "mrpc")
-    metric = load_metric("glue", "mrpc")
 
     def tokenize_function(examples):
         # max_length=None => use the model max length (it's actually the default)
@@ -70,38 +64,71 @@ def training_function(config, args):
         return outputs
 
     # Apply the method we just defined to all the examples in all the splits of the dataset
-    tokenized_datasets = datasets.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=["idx", "sentence1", "sentence2"],
-    )
+    # starting with the main process first:
+    with accelerator.main_process_first():
+        tokenized_datasets = datasets.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=["idx", "sentence1", "sentence2"],
+        )
 
     # We also rename the 'label' column to 'labels' which is the expected name for labels by the models of the
     # transformers library
-    tokenized_datasets.rename_column_("label", "labels")
-
-    # If the batch size is too big we use gradient accumulation
-    gradient_accumulation_steps = 1
-    if batch_size > MAX_GPU_BATCH_SIZE:
-        gradient_accumulation_steps = batch_size // MAX_GPU_BATCH_SIZE
-        batch_size = MAX_GPU_BATCH_SIZE
+    tokenized_datasets = tokenized_datasets.rename_column("label", "labels")
 
     def collate_fn(examples):
-        # On TPU it's best to pad everything to the same length or training will be very slow.
-        if accelerator.distributed_type == DistributedType.TPU:
-            return tokenizer.pad(examples, padding="max_length", max_length=128, return_tensors="pt")
-        return tokenizer.pad(examples, padding="longest", return_tensors="pt")
+        # For Torchxla, it's best to pad everything to the same length or training will be very slow.
+        max_length = 128 if accelerator.distributed_type == DistributedType.XLA else None
+        # When using mixed precision we want round multiples of 8/16
+        if accelerator.mixed_precision == "fp8":
+            pad_to_multiple_of = 16
+        elif accelerator.mixed_precision != "no":
+            pad_to_multiple_of = 8
+        else:
+            pad_to_multiple_of = None
+
+        return tokenizer.pad(
+            examples,
+            padding="longest",
+            max_length=max_length,
+            pad_to_multiple_of=pad_to_multiple_of,
+            return_tensors="pt",
+        )
 
     # Instantiate dataloaders.
     train_dataloader = DataLoader(
-        tokenized_datasets["train"], shuffle=True, collate_fn=collate_fn, batch_size=batch_size
+        tokenized_datasets["train"], shuffle=True, collate_fn=collate_fn, batch_size=batch_size, drop_last=True
     )
     eval_dataloader = DataLoader(
-        tokenized_datasets["validation"], shuffle=False, collate_fn=collate_fn, batch_size=EVAL_BATCH_SIZE
+        tokenized_datasets["validation"],
+        shuffle=False,
+        collate_fn=collate_fn,
+        batch_size=EVAL_BATCH_SIZE,
+        drop_last=(accelerator.mixed_precision == "fp8"),
     )
 
-    set_seed(seed)
+    return train_dataloader, eval_dataloader
 
+
+def training_function(config, args):
+    # Initialize accelerator
+    accelerator = Accelerator(cpu=args.cpu, mixed_precision=args.mixed_precision)
+    # Sample hyper-parameters for learning rate, batch size, seed and a few other HPs
+    lr = config["lr"]
+    num_epochs = int(config["num_epochs"])
+    seed = int(config["seed"])
+    batch_size = int(config["batch_size"])
+
+    metric = evaluate.load("glue", "mrpc")
+
+    # If the batch size is too big we use gradient accumulation
+    gradient_accumulation_steps = 1
+    if batch_size > MAX_GPU_BATCH_SIZE and accelerator.distributed_type != DistributedType.XLA:
+        gradient_accumulation_steps = batch_size // MAX_GPU_BATCH_SIZE
+        batch_size = MAX_GPU_BATCH_SIZE
+
+    set_seed(seed)
+    train_dataloader, eval_dataloader = get_dataloaders(accelerator, batch_size)
     # Instantiate the model (we build the model here so that the seed also control new weights initialization)
     model = AutoModelForSequenceClassification.from_pretrained("bert-base-cased", return_dict=True)
 
@@ -109,23 +136,22 @@ def training_function(config, args):
     # Note that if you are placing tensors on devices manually, this line absolutely needs to be before the optimizer
     # creation otherwise training will not work on TPU (`accelerate` will kindly throw an error to make us aware of that).
     model = model.to(accelerator.device)
-
     # Instantiate optimizer
-    optimizer = AdamW(params=model.parameters(), lr=lr, correct_bias=correct_bias)
+    optimizer = AdamW(params=model.parameters(), lr=lr)
+
+    # Instantiate scheduler
+    lr_scheduler = get_linear_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=100,
+        num_training_steps=(len(train_dataloader) * num_epochs) // gradient_accumulation_steps,
+    )
 
     # Prepare everything
     # There is no specific order to remember, we just need to unpack the objects in the same order we gave them to the
     # prepare method.
-    model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader
-    )
 
-    # Instantiate learning rate scheduler after preparing the training dataloader as the prepare method
-    # may change its length.
-    lr_scheduler = get_linear_schedule_with_warmup(
-        optimizer=optimizer,
-        num_warmup_steps=100,
-        num_training_steps=len(train_dataloader) * num_epochs,
+    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
 
     # Now we train the model
@@ -150,22 +176,33 @@ def training_function(config, args):
             with torch.no_grad():
                 outputs = model(**batch)
             predictions = outputs.logits.argmax(dim=-1)
+            predictions, references = accelerator.gather_for_metrics((predictions, batch["labels"]))
+            print(f"=====  {predictions}")
             metric.add_batch(
-                predictions=accelerator.gather(predictions),
-                references=accelerator.gather(batch["labels"]),
+                predictions=predictions,
+                references=references,
             )
 
         eval_metric = metric.compute()
         # Use accelerator.print to print only on the main process.
         accelerator.print(f"epoch {epoch}:", eval_metric)
+    accelerator.end_training()
 
 
 def main():
     parser = argparse.ArgumentParser(description="Simple example of training script.")
-    parser.add_argument("--fp16", action="store_true", help="If passed, will use FP16 training.")
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default=None,
+        choices=["no", "fp16", "bf16", "fp8"],
+        help="Whether to use mixed precision. Choose"
+        "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10."
+        "and an Nvidia Ampere GPU.",
+    )
     parser.add_argument("--cpu", action="store_true", help="If passed, will train on the CPU.")
     args = parser.parse_args()
-    config = {"lr": 2e-5, "num_epochs": 3, "correct_bias": True, "seed": 42, "batch_size": 16}
+    config = {"lr": 2e-5, "num_epochs": 3, "seed": 42, "batch_size": 16}
     training_function(config, args)
 
 
